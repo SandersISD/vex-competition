@@ -1,0 +1,8 @@
+/build/
+/bin/
+.DS_Store
+__pycache__/
+*.pyc
+compile_commands.json
+/site/
+motion-lib/site/

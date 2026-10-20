@@ -1,0 +1,19 @@
+{
+  "extension": {
+    "version": "0.8.2026020401",
+    "json": 2
+  },
+  "project": {
+    "name": "vex-competition",
+    "description": "VEX V5 competition robot snapshot",
+    "creationDate": "25/09/2026, 09:30:27",
+    "platform": "V5",
+    "language": "cpp",
+    "slot": 6,
+    "sdkVersion": "V5_20240802_15_00_00",
+    "cpp": {
+      "includePath": [],
+      "printf_float": true
+    }
+  }
+}
