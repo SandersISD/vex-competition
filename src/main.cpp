@@ -1,5 +1,6 @@
 #include "vex.h"
 #include "MotionLib/Drive.hpp"
+#include "MotionLib/Commands.hpp"
 #include <math.h>
 #include <cmath>
 
@@ -8,10 +9,10 @@
 #define START_TOGGLE_TWICE 1
 #endif
 #ifndef MIRROR_X_AXIS
-#define MIRROR_X_AXIS 0
+#define MIRROR_X_AXIS 1
 #endif
 #ifndef CLAMP_SECOND_PIN
-#define CLAMP_SECOND_PIN 0
+#define CLAMP_SECOND_PIN 1
 #endif
 
 // Headers share symbol names; include exactly one to avoid double mirroring.
@@ -143,213 +144,97 @@ bool autonMayContinue() {
   return BENCH_AUTON || (Competition.isEnabled() && Competition.isAutonomous());
 }
 
-bool firstPinFailure(const char* reason) {
-  stopAllMotors();
-  Brain.Screen.printAt(10, 180, false, "FIRST PIN STOP: %s", reason);
-  return false;
+// Robot-specific functions. Sequencing/failure handling belongs to MotionLib.
+void autonMessage(const char* text) {
+  Brain.Screen.printAt(10, 180, false, "%s", text);
 }
+void flipToggle(double degrees) {
+  SideToggle.setVelocity(100.0, vex::pct);
+  SideToggle.setStopping(vex::hold);
+  SideToggle.setTimeout(2000, vex::msec);
+  SideToggle.spinFor(vex::reverse, degrees, vex::deg, false);
+  toggleCounter += degrees;
+}
+void clamp() { Claw.set(false); }
+void releaseClamp() { Claw.set(true); }
+void startCascade(double target, double speed) {
+  Cascade.setStopping(vex::brake);
+  Cascade.setTimeout(MECHANISM_TIMEOUT_MS, vex::msec);
+  Cascade.setVelocity(speed, vex::pct);
+  Cascade.spinToPosition(target, vex::deg, false);
+}
+void cascadeSpeed(double speed) { Cascade.setVelocity(speed, vex::pct); }
 
-bool waitCascadeAt(double target) {
+// Keep the tested two-motor height check and 0.5s continuation behavior.
+// Return false only for invalid feedback or disabled autonomous.
+bool waitCascade(double target) {
   vex::timer timer;
   timer.reset();
   while (autonMayContinue()) {
     drive.odom().update();
     const double a = PulleyMotorA.position(vex::deg);
     const double b = PulleyMotorB.position(vex::deg);
-    if (!std::isfinite(a) || !std::isfinite(b))
-      return firstPinFailure("invalid cascade position");
-    if (fabs(target - a) <= CASCADE_POSITION_TOLERANCE_DEG &&
-        fabs(target - b) <= CASCADE_POSITION_TOLERANCE_DEG) {
+    if (!std::isfinite(a) || !std::isfinite(b)) return false;
+    if ((fabs(target - a) <= CASCADE_POSITION_TOLERANCE_DEG &&
+         fabs(target - b) <= CASCADE_POSITION_TOLERANCE_DEG) ||
+        timer.time(vex::msec) >= 500) {
       Cascade.stop(vex::brake);
+      if (timer.time(vex::msec) >= 500)
+        autonMessage("Cascade wait 0.5s; continuing");
       return true;
-    }
-    if (timer.time(vex::msec) >= 500) {
-      Cascade.stop(vex::brake);
-      Brain.Screen.printAt(10, 180, "Cascade wait 0.5s; continuing");
-      return true; // permission to proceed, NOT confirmation of target height
     }
     vex::wait(10, vex::msec);
   }
-  return firstPinFailure("autonomous disabled");
-}
-
-bool checkedTurn(double heading) {
-  if (!autonMayContinue()) return firstPinFailure("autonomous disabled");
-  heading = fieldHeading(heading);
-  drive.odom().update();
-  const double initial = drive.get_theta();
-  if (!std::isfinite(heading) || !std::isfinite(initial))
-    return firstPinFailure("invalid turn pose");
-  drive.turnTo(heading, 25.0);
-  drive.odom().update();
-  const double error = remainder(heading - drive.get_theta(), 360.0);
-  if (!autonMayContinue() || !std::isfinite(error) ||
-      fabs(error) > END_HEADING_TOLERANCE_DEG)
-    return firstPinFailure("turn failed");
-  return true;
-}
-
-// Coarse signed-distance move: no PID settling/repeated endpoint correction.
-// Stop on first entry within 1.5 inches. Max 60%, heading hold as in Drive.
-// A true return permits continuation; it does not guarantee target arrival.
-// By request, 0.5s without progress brakes then continues by default.
-bool checkedStraight(double inches, bool continueOnStall = true) {
-  if (!autonMayContinue()) return firstPinFailure("autonomous disabled");
-  if (!std::isfinite(inches)) return firstPinFailure("invalid distance");
-  drive.odom().update();
-  const double start = OdomY.position(vex::deg);
-  const double heading = drive.get_theta();
-  const double direction = inches < 0.0 ? -1.0 : 1.0;
-  const double target = fabs(inches);
-  const double inPerDegree = M_PI * (TRACKING_WHEEL_DIAMETER / UNIT_PER_IN) / 360.0;
-  if (!std::isfinite(start) || !std::isfinite(heading))
-    return firstPinFailure("invalid straight pose");
-  vex::timer timer;
-  timer.reset();
-  double furthest = 0.0;
-  double lastProgressMs = 0.0;
-  while (autonMayContinue()) {
-    drive.odom().update();
-    const double progress = direction * (OdomY.position(vex::deg) - start) * inPerDegree;
-    const double headingError = remainder(heading - drive.get_theta(), 360.0);
-    if (!std::isfinite(progress) || !std::isfinite(headingError))
-      return firstPinFailure("invalid straight feedback");
-    const double remaining = target - progress;
-    if (remaining <= 1.5) {
-      LeftDrive.stop(vex::brake);
-      RightDrive.stop(vex::brake);
-      drive.odom().update();
-      // Acceptance is at brake command; physical braking can add travel.
-      return true;
-    }
-    if (progress > furthest + 0.25) {
-      furthest = progress;
-      lastProgressMs = timer.time(vex::msec);
-    }
-    if (timer.time(vex::msec) - lastProgressMs >= 500 ||
-        timer.time(vex::msec) >= 1000 + target * 80.0) {
-      if (!continueOnStall) return firstPinFailure("straight stalled/timeout");
-      // Brake the drivetrain only: do not interrupt the concurrent lift.
-      LeftDrive.stop(vex::brake);
-      RightDrive.stop(vex::brake);
-      Brain.Screen.printAt(10, 180, "Straight stalled/timeout; continuing");
-      return true;
-    }
-    const double power = direction * clampd(3.8 * remaining, 12.0, 60.0);
-    const double correction = clampd(0.8 * headingError, -15.0, 15.0);
-    LeftDrive.spin(vex::forward, clampd(power + correction, -60.0, 60.0), vex::pct);
-    RightDrive.spin(vex::forward, clampd(power - correction, -60.0, 60.0), vex::pct);
-    vex::wait(10, vex::msec);
-  }
-  return firstPinFailure("autonomous disabled");
-}
-
-// Shared physical-base seating push. This is not obstacle detection.
-bool rushForward() {
-  if (!autonMayContinue()) return firstPinFailure("autonomous disabled");
-  vex::timer alignment;
-  alignment.reset();
-  while (alignment.time(vex::msec) < 500 && autonMayContinue()) {
-    LeftDrive.spin(vex::forward, 75.0, vex::pct);
-    RightDrive.spin(vex::forward, 75.0, vex::pct);
-    drive.odom().update();
-    vex::wait(10, vex::msec);
-  }
-  LeftDrive.stop(vex::brake);
-  RightDrive.stop(vex::brake);
-  if (!autonMayContinue()) return firstPinFailure("autonomous disabled");
-  return true;
+  return false;
 }
 
 void autonomous() {
-  if (!autonMayContinue()) return;
-  SideToggle.setVelocity(100.0, vex::pct);
-  SideToggle.setStopping(vex::hold);
-  SideToggle.setTimeout(2000, vex::msec);
-  SideToggle.spinFor(vex::reverse, START_TOGGLE_TWICE ? 360.0 : 180.0,
-                     vex::deg, false);
-  toggleCounter += START_TOGGLE_TWICE ? 360.0 : 180.0;
-  // Startup already initialized odometry. Back into the drawn starting pose
-  // before adopting the field coordinates; do not move the robot afterward.
-  Claw.set(false);
-  if (!checkedStraight(-10.0)) return;
+  motion::Commands robot(drive, stopAllMotors, autonMessage);
+  robot.setHeadingTransform(fieldHeading);
+  robot.setTurnTolerance(END_HEADING_TOLERANCE_DEG);
 
+  // Prepare and approach the first pin.
+  robot.action(flipToggle, START_TOGGLE_TWICE ? 360.0 : 180.0);
+  robot.action(clamp);
+  robot.backward(10.0);
+  robot.initPose(first_pin_start_x, first_pin_start_y, first_pin_start_h);
+  robot.action(startCascade, 500.0, 100.0); // raises while the robot follows the path
+  robot.follow(first_pin, first_pin_len, 0.8, 700);
+  robot.forwardFor(75.0, 500);
 
-  drive.init(first_pin_start_x, first_pin_start_y, first_pin_start_h);
-  Cascade.setStopping(vex::brake);
-  Cascade.setTimeout(MECHANISM_TIMEOUT_MS, vex::msec);
-  Cascade.setVelocity(100.0, vex::pct);
-  Cascade.spinToPosition(500.0, vex::deg, false);
+  // Drop the first pin.
+  robot.action(startCascade, 100.0, 80.0);
+  robot.action(waitCascade, 100.0);
+  robot.action(cascadeSpeed, 100.0);
+  robot.action(releaseClamp);
+  robot.wait(100);
 
-  // Stop pursuit after 700 ms without forward path progress, not total duration.
-  // Intentionally continue to the turn/rush even if pursuit stalls/times out.
-  // Geometry and start pose are already mirrored in the selected header.
-  drive.follow(first_pin, first_pin_len, 0.8, -1, 700);
-  if (!autonMayContinue()) { firstPinFailure("autonomous disabled"); return; }
+  // Approach the next set.
+  robot.turnTo(180.0);
+  robot.backward(16.0);
+  robot.turnTo(135.0);
+  robot.forward(25.0);
 
-  // Do not require endpoint position after a stalled approach. Keep invalid
-  // odometry, disabled-mode, lift and final-heading checks as hard failures.
+#if CLAMP_SECOND_PIN
+  robot.action(clamp);
+  robot.action(startCascade, 1000.0, 80.0);
+  robot.wait(100);
 
-  // drive.odom().update();
-  // if (!std::isfinite(drive.get_x()) || !std::isfinite(drive.get_y()) ||
-  //     !std::isfinite(drive.get_theta())) {
-  //   firstPinFailure("invalid approach pose");
-  //   return;
-  // }
-  // if (!waitCascadeAt(500.0)) return;
+  // Return to the base. These values preserve the current tested tuning.
+  robot.backward(26.0);
+  robot.turnTo(180.0);
+  robot.forward(17.0);
+  robot.action(waitCascade, 500.0);
+  robot.forwardFor(75.0, 500);
 
-  // const double endHeading = first_pin_endpoints[first_pin_endpoints_len - 1].heading;
-  // if (!std::isfinite(endHeading) || endHeading < 0.0) {
-  //   firstPinFailure("invalid endpoint heading");
-  //   return;
-  // }
+  // Drop the next set.
+  robot.action(startCascade, 100.0, 80.0);
+  robot.action(waitCascade, 100.0);
+  robot.action(cascadeSpeed, 100.0);
+  robot.action(releaseClamp);
+#endif
 
-  // if (!checkedTurn(fieldHeading(endHeading))) return; // header heading already mirrored
-
-  if (!rushForward()) return;
-
-  // Lower to an absolute MOTOR position only AFTER seating stops.
-  Cascade.setVelocity(80.0, vex::pct);
-  Cascade.spinToPosition(100.0, vex::deg, false);
-  if (!waitCascadeAt(100.0)) return;
-  Cascade.setVelocity(100.0, vex::pct);
-  Claw.set(true);
-  vex::wait(100, vex::msec); // original pause after the first-pin claw action
-
-  if (!checkedTurn(180.0)) return;
-  if (!checkedStraight(-16.0)) return;
-  if (!checkedTurn(135.0)) return;
-  if (!checkedStraight(25.0)) return;
-  if (!autonMayContinue()) { firstPinFailure("autonomous disabled"); return; }
-
-  #if(CLAMP_SECOND_PIN)
-
-  Claw.set(false); // reclamp the next set
-  Cascade.setVelocity(80.0, vex::pct);
-  Cascade.spinToPosition(1000.0, vex::deg, false);
-  vex::wait(100, vex::msec); // allow the pneumatic action before retreating
-
-  if (!checkedStraight(-26.0)) return;
-  if (!checkedTurn(180.0)) return;
-  if (!checkedStraight(17.0, true)) return; // may seat against the base early
-  if (!waitCascadeAt(500.0)) return;
-  if (!rushForward()) return;
-
-  // Return rush has stopped: lower, verify, then release the next set.
-  Cascade.setVelocity(80.0, vex::pct);
-  Cascade.spinToPosition(100.0, vex::deg, false);
-  if (!waitCascadeAt(100.0)) return;
-  Cascade.setVelocity(100.0, vex::pct);
-  if (!autonMayContinue()) { firstPinFailure("autonomous disabled"); return; }
-  Claw.set(true);
-
-  #endif
-
-  LeftDrive.stop(vex::brake);
-  RightDrive.stop(vex::brake);
-  Brain.Screen.printAt(10, 180, "Second set dropped; stopped");
-
-  
+  robot.finish();
 }
 
 // ------------------------------------------------------------------ driver
@@ -480,6 +365,10 @@ int main() {
   drive.setTurnGains(0.6, 0.0, 0.0, 0.0);
   drive.setLookahead(6.0);
   drive.setSpeedProfile(50.0, 8.0, 6.0);
+  drive.setMoveTolerance(1.5);
+  drive.setStallTimeout(500);
+  drive.setFailurePolicy(motion::FailurePolicy::Continue);
+  drive.setContinueCondition(autonMayContinue);
 
   Solenoid.set(false);
   Brain.Screen.print("Calibrating...");

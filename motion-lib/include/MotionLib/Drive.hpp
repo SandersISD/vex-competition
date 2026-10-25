@@ -20,6 +20,10 @@
 
 namespace motion {
 
+// Results describe what happened; the application decides whether to continue.
+enum class MoveResult { Reached, Stalled, Timeout, Invalid, Cancelled };
+enum class FailurePolicy { Stop, Continue };
+
 class Drive {
 public:
   // Hand over everything the robot IS - your own device objects, built in your
@@ -64,6 +68,34 @@ public:
   void turnLeft(double heading, double speed);  // counterclockwise only
   void turnRight(double heading, double speed); // clockwise only
 
+  // Coarse signed move, migrated from the tested robot controller.
+  // +inches = forward, -inches = backward; accepts within 1.5 inches.
+  // P=3.8; 12% minimum (or max_speed if lower); heading hold=0.8.
+  // Stall: 500 ms without 0.25-inch progress; total: 1000+80 ms/inch.
+  // No PID settling. Every exit brakes the drivetrain only.
+  // Optional callback: false cancels (e.g. competition disabled).
+  MoveResult moveStraight(double inches, double max_speed = 60.0,
+                          bool (*canContinue)() = nullptr);
+
+  // Friendly additive API. Legacy forward/backward/turnTo remain unchanged.
+  bool setMoveTolerance(double inches); // finite, >0; default 1.5
+  bool setStallTimeout(int milliseconds); // >=0; 0 disables; default 500
+  void setFailurePolicy(FailurePolicy policy) { _failure_policy = policy; }
+  void setContinueCondition(bool (*condition)()) { _can_continue = condition; }
+  bool canContinue() const { return !_can_continue || _can_continue(); }
+  bool shouldContinue(MoveResult result) const;
+  bool shouldContinue(FollowResult result) const;
+  void stop(); // drivetrain brake only
+
+  MoveResult moveForward(double inches, double max_speed = 60.0);
+  MoveResult moveBackward(double inches, double max_speed = 60.0);
+  MoveResult forwardFor(double speed, int milliseconds);
+  MoveResult backwardFor(double speed, int milliseconds);
+  MoveResult turn(double heading, double speed = 25.0); // absolute, shortest arc
+  MoveResult turnBy(double degrees, double speed = 25.0); // signed relative
+  FollowResult followPath(const PathPoint* pts, int len, double speed_scale = 1.0,
+                          int last_pt = -1, int stall_timeout_ms = 0);
+
   // Follow a generated path array (tools/path2h.py):
   //   drive.follow(path, path_len);
   // Blocking; ends within ~2" of the path's last moving point.
@@ -91,7 +123,13 @@ public:
 
 private:
   void _drive(double distance, double speed);
-  void _turn(double target_heading, double speed, int direction);
+  MoveResult _turn(double target_heading, double speed, int direction,
+                   bool (*canContinue)() = nullptr, bool relative = false);
+  MoveResult _timed(double speed, int milliseconds, bool reverse);
+  double _move_tolerance = 1.5;
+  int _stall_timeout_ms = 500;
+  FailurePolicy _failure_policy = FailurePolicy::Stop;
+  bool (*_can_continue)() = nullptr;
 
   vex::motor_group* _left;
   vex::motor_group* _right;

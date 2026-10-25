@@ -50,7 +50,7 @@ struct PathEndpoint {
 namespace motion {
 
 enum class PathDirection { Forward, Reverse, Auto };
-enum class FollowResult { Reached, Timeout, Invalid, MissedEndpoint };
+enum class FollowResult { Reached, Timeout, Invalid, MissedEndpoint, Stalled, Cancelled };
 
 
 class Pursuit {
@@ -90,6 +90,35 @@ public:
               int last_pt = -1, int stall_timeout_ms = 0) {
     if (len < 2) return;
     run(pts, len, speed_scale, last_pt, false, false, stall_timeout_ms);
+  }
+
+  // Result-returning legacy geometry, with optional mode cancellation.
+  FollowResult followResult(const PathPoint* pts, int len, double speed_scale = 1.0,
+                             int last_pt = -1, int stall_timeout_ms = 0,
+                             bool (*canContinue)() = nullptr) {
+    if (canContinue && !canContinue()) {
+      _left->stop(vex::brake); _right->stop(vex::brake);
+      return FollowResult::Cancelled;
+    }
+    if (!pts || len < 2 || !std::isfinite(speed_scale) || speed_scale <= 0.0 ||
+        speed_scale > 1.0 || last_pt < -1 || last_pt >= len || stall_timeout_ms < 0)
+      return invalid();
+    if (!std::isfinite(track_width) || track_width <= 0.0 ||
+        !std::isfinite(lookahead) || lookahead <= 0.0 ||
+        !std::isfinite(max_accel) || max_accel <= 0.0 ||
+        !std::isfinite(end_decel_zone) || end_decel_zone < 0.0 ||
+        !std::isfinite(end_min_speed) || end_min_speed < 0.0)
+      return invalid();
+    bool moving = false;
+    for (int i = 0; i < len; ++i) {
+      if (!std::isfinite(pts[i].x) || !std::isfinite(pts[i].y) ||
+          !std::isfinite(pts[i].speed) || pts[i].speed < 0.0 || pts[i].speed > 100.0)
+        return invalid();
+      moving = moving || pts[i].speed > 0.0;
+    }
+    if (!moving) return invalid();
+    return run(pts, len, speed_scale, last_pt, false, false,
+                stall_timeout_ms, canContinue);
   }
 
   // pts is ONE segment only, ending at a drawn endpoint. Auto chooses once
@@ -143,7 +172,8 @@ private:
   }
 
   FollowResult run(const PathPoint* pts, int len, double speed_scale,
-                   int last_pt, bool segment, bool reverse, int stall_timeout_ms = 0) {
+                   int last_pt, bool segment, bool reverse, int stall_timeout_ms = 0,
+                   bool (*canContinue)() = nullptr) {
 
     // Last point that actually moves; the robot finishes within 2" of it.
     int end_index = len - 1;
@@ -163,17 +193,19 @@ private:
     bool reached = false;
     bool missed = false;
     bool stalled = false;
+    bool cancelled = false;
     double furthest_progress = -HUGE_VAL;
     double progress_ms = 0.0;
     int iter = 0;
     double v_out = 0.0; // slewed speed command (pct)
 
     while (t.time(vex::msec) < timeout) {
+      if (canContinue && !canContinue()) { cancelled = true; break; }
       _odom->update();
       double rx = _odom->get_x();
       double ry = _odom->get_y();
       double th = (_odom->get_theta() + (reverse ? 180.0 : 0.0)) * M_PI / 180.0;
-      if (segment && (!std::isfinite(rx) || !std::isfinite(ry) || !std::isfinite(th)))
+      if (!std::isfinite(rx) || !std::isfinite(ry) || !std::isfinite(th))
         return invalid();
 
       // 1) Advance cursor to the nearest of the next few points (forward only)
@@ -289,7 +321,8 @@ private:
     _odom->update();
     _ui->Screen.printAt(10, 80, reached ? "EXIT: reached end" :
                          (missed ? "EXIT: MISSED endpoint" :
-                          (stalled ? "EXIT: STALLED" : "EXIT: TIMEOUT")));
+                          (stalled ? "EXIT: STALLED" :
+                           (cancelled ? "EXIT: CANCELLED" : "EXIT: TIMEOUT"))));
     _ui->Screen.printAt(10, 110, "final X:%6.1f Y:%6.1f H:%6.1f",
                          _odom->get_x(), _odom->get_y(), _odom->get_theta());
     _ui->Screen.printAt(10, 140, "dEnd:%5.1f t:%5.1fs",
@@ -299,7 +332,9 @@ private:
     _left->stop(vex::brake);
     _right->stop(vex::brake);
     return reached ? FollowResult::Reached :
-           (missed ? FollowResult::MissedEndpoint : FollowResult::Timeout);
+           (missed ? FollowResult::MissedEndpoint :
+            (cancelled ? FollowResult::Cancelled :
+             (stalled ? FollowResult::Stalled : FollowResult::Timeout)));
   }
 
 private:

@@ -7,6 +7,7 @@
 // with vex::forward (the direction enum value). Everything is qualified.
 #include "MotionLib/Drive.hpp"
 #include <math.h>
+#include <cmath>
 
 namespace motion {
 
@@ -83,11 +84,19 @@ void Drive::_drive(double distance, double speed) {
 // ---------- turn ------------------------------------------------------------
 // direction: 0 = shortest path, -1 = counterclockwise only, +1 = clockwise only
 // Heading is continuous (odom), so constrained turns may travel past 360.
-void Drive::_turn(double target_heading, double speed, int direction) {
+MoveResult Drive::_turn(double target_heading, double speed, int direction,
+                        bool (*canContinue)(), bool relative) {
+  const auto finish = [this](MoveResult result) { stop(); return result; };
+  if (canContinue && !canContinue()) return finish(MoveResult::Cancelled);
+  if (!std::isfinite(target_heading) || !std::isfinite(speed) || speed <= 0.0 || speed > 100.0)
+    return finish(MoveResult::Invalid);
+  _odom.update();
   double current = _odom.get_theta();
+  if (!std::isfinite(current)) return finish(MoveResult::Invalid);
   double rel = fmod(target_heading - current, 360.0);
   double travel;
-  if (direction == 0)     travel = wrap180(target_heading - current);
+  if (relative) travel = target_heading;
+  else if (direction == 0)     travel = wrap180(target_heading - current);
   else if (direction > 0) travel = (rel < 0.0) ? rel + 360.0 : rel; // cw:  0..360
   else                    travel = (rel > 0.0) ? rel - 360.0 : rel; // ccw: -360..0
 
@@ -99,15 +108,149 @@ void Drive::_turn(double target_heading, double speed, int direction) {
   int timeout = 2000 + (int)(fabs(travel) * 400.0 / fmax(speed, 5.0)); // ms
 
   while (t.time(vex::msec) < timeout && !_turn_pid.is_settled()) {
+    if (canContinue && !canContinue()) return finish(MoveResult::Cancelled);
     _odom.update();
+    if (!std::isfinite(_odom.get_theta())) return finish(MoveResult::Invalid);
     double power = _turn_pid.compute(_odom.get_theta());
     _left->spin(vex::forward, power, vex::pct);
     _right->spin(vex::forward, -power, vex::pct);
     vex::wait(10, vex::msec);
   }
 
+  return finish(_turn_pid.is_settled() ? MoveResult::Reached : MoveResult::Timeout);
+}
+
+// Coarse straight controller: preserve the robot-side tested control law.
+MoveResult Drive::moveStraight(double inches, double max_speed,
+                               bool (*canContinue)()) {
+  const auto finish = [this](MoveResult result) {
+    _left->stop(vex::brake);
+    _right->stop(vex::brake);
+    return result;
+  };
+  if (!canContinue) canContinue = _can_continue;
+  if (canContinue && !canContinue()) return finish(MoveResult::Cancelled);
+  if (!std::isfinite(inches) || !std::isfinite(max_speed) || max_speed <= 0.0 ||
+      max_speed > 100.0 || !std::isfinite(_y_in_per_deg) || _y_in_per_deg <= 0.0)
+    return finish(MoveResult::Invalid);
+  _odom.update();
+  const double start = _pod_y->position(vex::deg);
+  const double heading = _odom.get_theta();
+  const double direction = inches < 0.0 ? -1.0 : 1.0;
+  const double target = fabs(inches);
+  if (!std::isfinite(start) || !std::isfinite(heading))
+    return finish(MoveResult::Invalid);
+  vex::timer timer;
+  timer.reset();
+  double furthest = 0.0;
+  double last_progress_ms = 0.0;
+  while (!canContinue || canContinue()) {
+    _odom.update();
+    const double progress = direction * (_pod_y->position(vex::deg) - start) *
+                            _y_in_per_deg;
+    const double heading_error = remainder(heading - _odom.get_theta(), 360.0);
+    if (!std::isfinite(progress) || !std::isfinite(heading_error))
+      return finish(MoveResult::Invalid);
+    const double remaining = target - progress;
+    if (remaining <= _move_tolerance) {
+      _odom.update();
+      return finish(MoveResult::Reached);
+    }
+    if (progress > furthest + 0.25) {
+      furthest = progress;
+      last_progress_ms = timer.time(vex::msec);
+    }
+    if (_stall_timeout_ms > 0 && timer.time(vex::msec) - last_progress_ms >= _stall_timeout_ms)
+      return finish(MoveResult::Stalled);
+    if (timer.time(vex::msec) >= 1000 + target * 80.0)
+      return finish(MoveResult::Timeout);
+    const double power = direction * fmax(fmin(12.0, max_speed),
+                                          fmin(3.8 * remaining, max_speed));
+    const double correction = fmax(-15.0, fmin(0.8 * heading_error, 15.0));
+    _left->spin(vex::forward,
+                fmax(-max_speed, fmin(power + correction, max_speed)), vex::pct);
+    _right->spin(vex::forward,
+                 fmax(-max_speed, fmin(power - correction, max_speed)), vex::pct);
+    vex::wait(10, vex::msec);
+  }
+  return finish(MoveResult::Cancelled);
+}
+
+void Drive::stop() {
   _left->stop(vex::brake);
   _right->stop(vex::brake);
+}
+
+bool Drive::setMoveTolerance(double inches) {
+  if (!std::isfinite(inches) || inches <= 0.0) return false;
+  _move_tolerance = inches;
+  return true;
+}
+bool Drive::setStallTimeout(int milliseconds) {
+  if (milliseconds < 0) return false;
+  _stall_timeout_ms = milliseconds;
+  return true;
+}
+bool Drive::shouldContinue(MoveResult result) const {
+  return result == MoveResult::Reached ||
+      (_failure_policy == FailurePolicy::Continue &&
+       (result == MoveResult::Stalled || result == MoveResult::Timeout));
+}
+bool Drive::shouldContinue(FollowResult result) const {
+  return result == FollowResult::Reached ||
+      (_failure_policy == FailurePolicy::Continue &&
+       (result == FollowResult::Stalled || result == FollowResult::Timeout));
+}
+MoveResult Drive::moveForward(double inches, double speed) {
+  if (!std::isfinite(inches) || inches < 0.0) { stop(); return MoveResult::Invalid; }
+  return moveStraight(inches, speed);
+}
+MoveResult Drive::moveBackward(double inches, double speed) {
+  if (!std::isfinite(inches) || inches < 0.0) { stop(); return MoveResult::Invalid; }
+  return moveStraight(-inches, speed);
+}
+MoveResult Drive::_timed(double speed, int milliseconds, bool reverse) {
+  const auto finish = [this](MoveResult result) { stop(); return result; };
+  if (!std::isfinite(speed) || speed < 0.0 || speed > 100.0 || milliseconds < 0)
+    return finish(MoveResult::Invalid);
+  if (_can_continue && !_can_continue()) return finish(MoveResult::Cancelled);
+  vex::timer timer;
+  timer.reset();
+  while (timer.time(vex::msec) < milliseconds) {
+    if (_can_continue && !_can_continue()) return finish(MoveResult::Cancelled);
+    _odom.update();
+    if (!std::isfinite(_odom.get_x()) || !std::isfinite(_odom.get_y()) ||
+        !std::isfinite(_odom.get_theta())) return finish(MoveResult::Invalid);
+    const double power = reverse ? -speed : speed;
+    _left->spin(vex::forward, power, vex::pct);
+    _right->spin(vex::forward, power, vex::pct);
+    // Avoid rounding a requested duration up by a whole 10-ms tick.
+    vex::wait(fmin(10.0, milliseconds - timer.time(vex::msec)), vex::msec);
+  }
+  _odom.update();
+  if (_can_continue && !_can_continue()) return finish(MoveResult::Cancelled);
+  if (!std::isfinite(_odom.get_theta()) || !std::isfinite(_odom.get_x()) ||
+      !std::isfinite(_odom.get_y())) return finish(MoveResult::Invalid);
+  return finish(MoveResult::Reached); // requested duration elapsed, not distance
+}
+MoveResult Drive::forwardFor(double speed, int milliseconds) {
+  return _timed(speed, milliseconds, false);
+}
+MoveResult Drive::backwardFor(double speed, int milliseconds) {
+  return _timed(speed, milliseconds, true);
+}
+MoveResult Drive::turn(double heading, double speed) {
+  if (std::isfinite(heading)) heading = remainder(heading, 360.0);
+  return _turn(heading, speed, 0, _can_continue);
+}
+MoveResult Drive::turnBy(double degrees, double speed) {
+  if (!std::isfinite(degrees) || fabs(degrees) > 360.0) { stop(); return MoveResult::Invalid; }
+  return _turn(degrees, speed, 0, _can_continue, true);
+}
+FollowResult Drive::followPath(const PathPoint* pts, int len, double speed_scale,
+                               int last_pt, int stall_timeout_ms) {
+  return _pursuit.followResult(pts, len, speed_scale, last_pt,
+                               stall_timeout_ms, _can_continue);
 }
 
 // ---------- public API ----------

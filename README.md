@@ -82,3 +82,51 @@ make T="/path/to/V5_20240802_15_00_00"
 ```
 
 GNU-stack and RWX linker warnings occur with the bundled VEX toolchain.
+
+## Editing autonomous
+
+`autonomous()` in `src/main.cpp` is a sequence of actions:
+
+```cpp
+auton.turnTo(180.0);
+auton.backward(16.0);
+auton.turnTo(135.0);
+auton.forward(25.0);
+auton.action(clamp);
+```
+
+The reusable runner is `motion::Commands` in MotionLib. There is no
+robot-specific class or `auton_actions.h`. A fatal failure brakes the drive,
+invokes the robot's stop callback, and skips every later action. The configured
+Continue policy still accepts straight/path stalls and timeouts. Turns retain
+the stricter 5-degree final-heading check. Cascade waiting still permits
+continuation after 500 ms.
+
+Robot mechanisms are ordinary functions in `src/main.cpp`:
+
+```cpp
+auton.action(clamp);
+auton.action(startCascade, 500.0, 100.0);
+auton.action(waitCascade, 500.0);
+```
+
+A custom function returning false aborts the sequence. Void functions simply
+complete. Long-running custom functions must check cancellation internally.
+
+Mechanism commands use the existing autonomous booleans; manual control
+is unchanged. `startCascade(target, speed)` is nonblocking; `waitCascade`
+implements the robot's separate waiting policy. Distances are inches;
+cascade targets are motor degrees; waits and rush durations are milliseconds.
+
+See `motion-lib/README.md` for the reusable movement API and settings.
+Controller gains, route values and macro choices are unchanged, including
+the intentional 1000-degree cascade command followed by a 500-degree wait.
+Legacy MotionLib methods remain available.
+
+Host-side logic tests:
+
+```sh
+python3 motion-lib/tests/test_commands.py
+```
+
+These check sequencing/failure handling, not physical tracking accuracy.
