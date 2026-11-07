@@ -113,6 +113,14 @@ public:
   FollowResult followSegment(const PathPoint* pts, int len, double speed_scale,
                              PathDirection direction = PathDirection::Auto);
 
+  // Nonblocking manual arcade: joystick inputs (-100..100), original /8.3
+  // voltage mix, each side independently clamped to +/-12 V. Updates odometry.
+  // Does NOT use the autonomous cancellation callback or failure latch.
+  // Caller owns driver-mode gating. False on non-finite inputs (brakes).
+  bool arcade(double forward_input, double turn_input);
+  double get_left_command_volts() const { return _manual_left_volts; }
+  double get_right_command_volts() const { return _manual_right_volts; }
+
   // ------ telemetry ----------------------------------------------------------
   // The same odometry the motion code uses - read it in your display loop.
   Odom& odom() { return _odom; }
@@ -126,6 +134,8 @@ private:
   MoveResult _turn(double target_heading, double speed, int direction,
                    bool (*canContinue)() = nullptr, bool relative = false);
   MoveResult _timed(double speed, int milliseconds, bool reverse);
+  double _manual_left_volts = 0.0; // most recent arcade request, not measured voltage
+  double _manual_right_volts = 0.0;
   double _move_tolerance = 1.5;
   int _stall_timeout_ms = 500;
   FailurePolicy _failure_policy = FailurePolicy::Stop;

@@ -12,7 +12,7 @@ VEX = r"""
 #pragma once
 #include <cmath>
 namespace vex {
-enum units { msec, sec, forward, pct, brake, deg, degrees=deg };
+enum units { msec, sec, forward, pct, brake, deg, degrees=deg, volt };
 inline double now=0, left=0, right=0, pod=0, heading_value=0, gain=0.6;
 inline bool frozen=false;
 inline void wait(double ms, units) {
@@ -30,10 +30,10 @@ struct rotation {
 struct inertial { double heading(units) {return heading_value;} };
 struct motor_group {
   bool is_left; double first=0, peak=0;
-  void spin(units,double value,units) {
+  void spin(units,double value,units command_units) {
     if(first==0 && value!=0)first=value;
     peak=fmax(peak,fabs(value));
-    (is_left?left:right)=value;
+    (is_left?left:right)=command_units==volt ? value*100.0/12.0 : value;
   }
   void stop(units) {(is_left?left:right)=0;}
 };
@@ -140,6 +140,23 @@ int main(){
   drive.setContinueCondition(until);cancel_at=vex::now+20;
   assert(drive.forwardFor(40,100)==MoveResult::Cancelled);stopped();
   drive.setContinueCondition(nullptr);vex::frozen=false;
+
+  // Manual driving ignores the autonomous callback, preserving arcade mix.
+  drive.init();drive.setContinueCondition(never);
+  assert(drive.arcade(100,100));
+  assert(drive.get_left_command_volts()==12 && drive.get_right_command_volts()==0);
+  assert(drive.arcade(60,40));
+  assert(drive.get_left_command_volts()==12);
+  assert(fabs(drive.get_right_command_volts()-20.0/8.3)<1e-9);
+  assert(drive.arcade(-100,-100));
+  assert(drive.get_left_command_volts()==-12 && drive.get_right_command_volts()==0);
+  assert(drive.arcade(1,0)); // no new deadband
+  assert(fabs(drive.get_left_command_volts()-1.0/8.3)<1e-9);
+  assert(drive.arcade(50,0));vex::wait(20,vex::msec);
+  assert(drive.arcade(0,0));assert(drive.get_y()>0); // updates odometry
+  assert(!drive.arcade(std::numeric_limits<double>::quiet_NaN(),0));stopped();
+  assert(drive.get_left_command_volts()==0 && drive.get_right_command_volts()==0);
+  drive.setContinueCondition(nullptr);
 
   drive.init();vex::pod=std::numeric_limits<double>::quiet_NaN();
   assert(drive.moveStraight(10)==MoveResult::Invalid);stopped();

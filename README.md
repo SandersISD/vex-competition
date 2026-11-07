@@ -130,3 +130,25 @@ python3 motion-lib/tests/test_commands.py
 ```
 
 These check sequencing/failure handling, not physical tracking accuracy.
+
+## Driver-control updates
+
+Manual drivetrain mixing now lives in `Drive::arcade()`. It preserves the
+original /8.3 mix and per-side +/-12 V saturation. It is nonblocking and
+updates odometry; it intentionally ignores the autonomous cancellation
+callback. Driver-mode gating remains in main.
+
+The robot loop calls `updateClawButtons`, `updateCascade`, `updateSideToggle`
+and `updateDriverScreen`. Their transient state resets on driver-mode entry;
+toggle counter and fault latch persist as before. No odometry or mechanism
+zeroing is added to mode changes. Button priorities, polling intervals,
+correction formula and mechanism polarity are unchanged.
+
+```sh
+python3 tests/test_driver_updates.py
+python3 motion-lib/tests/test_straight_move.py
+python3 motion-lib/tests/test_commands.py
+python3 motion-lib/tests/test_segment_follow.py
+```
+
+These are host logic tests; repeat the hardware checks after refactoring.

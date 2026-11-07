@@ -122,3 +122,13 @@ Existing `forward`, `backward`, `turnTo`, `turnLeft`, `turnRight` and `follow`
 remain available. Coarse tolerance, stall policy and configured cancellation
 apply to the new API only; legacy forward/backward retain their old PID
 settling behavior. Do not assume the new failure policy controls legacy calls.
+
+## Manual driving
+
+Use `drive.arcade(forward, turn)` inside a driver-mode-gated loop. Inputs are
+joystick percentages; output is (forward +/- turn)/8.3 volts, clamped on each
+side to +/-12 V. No new deadband or shaping is enabled. The call updates
+odometry and returns immediately. Non-finite inputs brake and return false.
+It ignores the autonomous continuation callback: driver mode must be checked
+by the caller. `get_left_command_volts()` and `get_right_command_volts()` expose
+last arcade requests for telemetry, not measured motor voltage.

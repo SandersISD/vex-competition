@@ -176,7 +176,22 @@ MoveResult Drive::moveStraight(double inches, double max_speed,
   return finish(MoveResult::Cancelled);
 }
 
+bool Drive::arcade(double forward_input, double turn_input) {
+  if (!std::isfinite(forward_input) || !std::isfinite(turn_input)) {
+    stop();
+    return false;
+  }
+  _odom.update();
+  // Preserve the tested per-side saturation (not proportional normalization).
+  _manual_left_volts = fmax(-12.0, fmin((forward_input + turn_input) / 8.3, 12.0));
+  _manual_right_volts = fmax(-12.0, fmin((forward_input - turn_input) / 8.3, 12.0));
+  _left->spin(vex::forward, _manual_left_volts, vex::volt);
+  _right->spin(vex::forward, _manual_right_volts, vex::volt);
+  return true;
+}
+
 void Drive::stop() {
+  _manual_left_volts = _manual_right_volts = 0.0;
   _left->stop(vex::brake);
   _right->stop(vex::brake);
 }
